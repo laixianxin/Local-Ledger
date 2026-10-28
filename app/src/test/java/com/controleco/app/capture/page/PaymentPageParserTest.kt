@@ -44,8 +44,12 @@ class PaymentPageParserTest {
 
     private fun newFlow(pkg: String): PageFlow = PageFlowTracker().flow(pkg)
 
-    private fun candidate(pkg: String, texts: List<String>, flow: PageFlow = newFlow(pkg)) =
-        (parse(pkg, texts, flow) as PageParseResult.Candidate).candidate
+    private fun candidate(
+        pkg: String,
+        texts: List<String>,
+        flow: PageFlow = newFlow(pkg),
+        at: Long = capturedAt,
+    ) = (parse(pkg, texts, flow, at) as PageParseResult.Candidate).candidate
 
     // ---------- 微信 ----------
 
@@ -260,6 +264,81 @@ class PaymentPageParserTest {
         assertEquals(TxType.EXPENSE, r.type)
         assertEquals(1970L, r.amountCents)
         assertEquals(PageScene.PAYMENT_SUCCESS, r.scene)
+    }
+
+    @Test
+    fun `支付宝交易详情_只取支出实付并解析支付时间与商户`() {
+        val txTime = LocalDateTime.of(2026, 10, 26, 11, 4, 5)
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val captureTime = txTime + 60_000
+        val r = candidate(
+            NotificationRules.ALIPAY,
+            listOf(
+                "国网汇通金财（北京）信息科技有限公司",
+                "支出29.49元",
+                "交易成功",
+                "订单金额",
+                "29.50",
+                "支付宝随机抽立减",
+                "-0.01",
+                "支付时间",
+                "2026-10-26 11:04:05",
+                "付款方式",
+                "建设银行信用卡(****)",
+                "收款方全称",
+                "国网汇通金财（北京）信息科技有限公司",
+            ),
+            at = captureTime,
+        )
+        assertEquals(TxType.EXPENSE, r.type)
+        assertEquals(2949L, r.amountCents)
+        assertEquals("国网汇通金财（北京）信息科技有限公司", r.counterparty)
+        assertEquals(txTime, r.txTime)
+        assertEquals(PageScene.TRANSACTION_DETAIL, r.scene)
+        assertEquals(TradeState.SUCCESS, r.tradeState)
+        assertEquals("支付宝·交易详情", r.ruleName)
+    }
+
+    @Test
+    fun `支付宝交易详情_相同交易时间金额生成相同去重键并在同流程抑制重复`() {
+        val flow = newFlow(NotificationRules.ALIPAY)
+        val texts = listOf(
+            "国网汇通金财（北京）信息科技有限公司",
+            "支出29.49元",
+            "交易成功",
+            "订单金额", "29.50",
+            "支付宝随机抽立减", "-0.01",
+            "支付时间", "2026-10-26 11:04:05",
+            "付款方式", "建设银行信用卡(****)",
+        )
+        val first = candidate(NotificationRules.ALIPAY, texts, flow)
+        val nextFlowCandidate = candidate(NotificationRules.ALIPAY, texts, newFlow(NotificationRules.ALIPAY))
+        assertEquals(first.dedupKey, nextFlowCandidate.dedupKey)
+
+        val repeated = parse(NotificationRules.ALIPAY, texts, flow)
+        assertTrue(repeated is PageParseResult.SceneOnly)
+        assertEquals("支付宝交易详情页重复事件", (repeated as PageParseResult.SceneOnly).reason)
+    }
+
+    @Test
+    fun `支付宝交易详情_没有明确成功状态或支出金额时不生成候选`() {
+        val noSuccess = parse(
+            NotificationRules.ALIPAY,
+            listOf(
+                "国网汇通金财（北京）信息科技有限公司", "支出29.49元", "交易处理中",
+                "订单金额", "29.50", "支付时间", "2026-10-26 11:04:05", "付款方式", "建设银行信用卡(****)",
+            ),
+        )
+        assertTrue(noSuccess is PageParseResult.NotATradePage)
+
+        val noPaidAmount = parse(
+            NotificationRules.ALIPAY,
+            listOf(
+                "国网汇通金财（北京）信息科技有限公司", "支出", "交易成功",
+                "订单金额", "29.50", "支付时间", "2026-10-26 11:04:05", "付款方式", "建设银行信用卡(****)",
+            ),
+        )
+        assertTrue(noPaidAmount is PageParseResult.SceneOnly)
     }
 
     @Test

@@ -7,20 +7,23 @@ import com.controleco.app.util.Money
 /**
  * 支付宝（com.eg.android.AlipayGphone）页面解析器。
  *
- * **只保留有支付宝真机样本的动账结果页**：付款成功页。两种真实版式（2026-10 真机）：
+ * **只保留有支付宝真机样本的动账页面**：付款成功页，以及账单交易详情中的明确成功支出。版式：
  *
  * 1. 实付与标题分节点：
  *    `支付成功 | 回首页 | ￥ | 9.17 | 获得森林能量 | 鸿润福连锁超市 | ￥9.27 | 碰一下立减 | -￥0.10 | 付款方式 | 中国银行储蓄卡(****) …`
  * 2. 实付与标题同节点：
  *    `支付成功￥19.70 | 支付成功 | 19.70 | 订单金额 | ￥22.20 | 红包 | -￥2.50 | 付款方式 | 支付宝小荷包(…) …`
+ * 3. 账单交易详情：
+ *    `商户全称 | 支出29.49元 | 交易成功 | 订单金额 | 29.50 | ... | 支付时间 | 2026-10-26 11:04:05`
  *
  * 判据只有三条：
- * - 第一段可见文字必须以 `支付成功` 开头；
+ * - 结果页第一段可见文字必须以 `支付成功` 开头；详情页必须同时有 `交易成功`、明确支出金额、
+ *   支付时间和付款方式；
  * - 能取到标题内金额，或标题后的第一个金额（支持 `￥` 与数字拆成两个节点）；
- * - 不命中历史账单详情页字段（详情页正文里也可能出现“支付成功”作为当前状态）。
+ * - 详情页金额只取 `支出...元`，不取订单金额或优惠；交易时间参与去重。
  *
- * **不识别**首页、列表、收银台、失败/取消、收款、转账、退款、详情页，也没有对应的
- * 页面规则：这些场景在支付宝侧没有可追溯的真机样本（收入/退款由通知与短信通道负责）。
+ * **不识别**首页、列表、收银台、失败/取消、收款、转账、退款及缺少明确成功支出字段的详情页
+ * （收入/退款由通知与短信通道负责）。
  * 新增任何页面锚点/字段前必须先在 docs/自动记账捕获机制.md 记录来源，无明确证据不加入。
  */
 object AlipayPageParser : AppPageParser {
@@ -31,14 +34,19 @@ object AlipayPageParser : AppPageParser {
     private const val PAYMENT_SUCCESS = "支付成功"
 
     /**
-     * 历史账单详情页标记（仅用于拒绝，不生成账目）。
+     * 旧版成功页形态中的历史详情拒绝标记。明确成功支出详情在此前已按独立字段解析。
      *
-     * 来源：旧版生产页面规则中的 `billDetailKeywords`（账单详情/交易详情）、
-     * 成功页的“当前状态”守卫、详情页字段 `创建时间`/`交易单号`。
-     * 这些标记在旧版规则中已用于真实页面，避免把历史账单里的“支付成功”记成新支付。
+     * 这些标记来自旧版生产规则的 `billDetailKeywords`、成功页“当前状态”守卫及详情字段，
+     * 避免把正文里仅提到“支付成功”的历史详情误认成新的结果页。
      */
     private val historyDetailMarkers = listOf(
         "账单详情", "交易详情", "当前状态", "创建时间", "交易单号",
+    )
+
+    private val detailTimeLabels = listOf("支付时间", "付款时间", "交易时间")
+
+    private val detailAmountAfterExpense = Regex(
+        """[￥¥]?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*元""",
     )
 
     /**
@@ -55,6 +63,8 @@ object AlipayPageParser : AppPageParser {
 
     override fun parse(snapshot: PageSnapshot, flow: PageFlow): PageParseResult {
         val lines = snapshot.lines
+        if (isSuccessfulExpenseDetail(lines)) return parseSuccessfulExpenseDetail(snapshot, flow)
+
         val first = lines.firstOrNull()?.trim().orEmpty()
         if (!first.startsWith(PAYMENT_SUCCESS)) return PageParseResult.NotATradePage
 
@@ -100,6 +110,80 @@ object AlipayPageParser : AppPageParser {
                 ),
             ),
         )
+    }
+
+    private fun isSuccessfulExpenseDetail(lines: List<String>): Boolean =
+        lines.any { it.contains("交易成功") } &&
+                lines.any { it.contains("支出") } &&
+                lines.any { line -> detailTimeLabels.any(line::contains) } &&
+                lines.any { it.contains("付款方式") }
+
+    private fun parseSuccessfulExpenseDetail(
+        snapshot: PageSnapshot,
+        flow: PageFlow,
+    ): PageParseResult {
+        val lines = snapshot.lines
+        val txTime = PageParseSupport.timeFromPage(snapshot)
+            ?: return PageParseResult.SceneOnly(
+                PageScene.TRANSACTION_DETAIL, TradeState.SUCCESS, "支付宝交易详情页无支付时间",
+            )
+        val amountText = expenseAmount(lines)
+            ?: return PageParseResult.SceneOnly(
+                PageScene.TRANSACTION_DETAIL, TradeState.SUCCESS, "支付宝交易详情页无明确支出金额",
+            )
+        val amountCents = Money.parseCents(amountText)?.takeIf { it > 0 }
+            ?: return PageParseResult.SceneOnly(
+                PageScene.TRANSACTION_DETAIL, TradeState.SUCCESS, "支付宝交易详情页支出金额非法",
+            )
+        val orderId = PageParseSupport.orderIdFrom(lines)
+        val identity = orderId ?: txTime.toString()
+        if (flow.markEmitted("ali-detail|$amountCents|$identity") < 0) {
+            return PageParseResult.SceneOnly(
+                PageScene.TRANSACTION_DETAIL, TradeState.SUCCESS, "支付宝交易详情页重复事件",
+            )
+        }
+
+        val instrument = paymentInstrumentOf(lines)
+        flow.noteSuccess(instrument)
+        val counterparty = PageParseSupport.valueAfterLabel(lines, PageParseSupport.counterpartyLabels)
+            ?: lines.firstOrNull()?.substringBefore("支出")?.trim()?.takeIf { it.isNotBlank() }
+        return PageParseResult.Candidate(
+            PageCandidate(
+                type = TxType.EXPENSE,
+                amountCents = amountCents,
+                counterparty = counterparty.orEmpty().take(60),
+                paymentMethod = instrument?.label,
+                instrument = instrument,
+                txTime = txTime,
+                scene = PageScene.TRANSACTION_DETAIL,
+                tradeState = TradeState.SUCCESS,
+                confidence = if (counterparty.isNullOrBlank()) ParseConfidence.MEDIUM else ParseConfidence.HIGH,
+                sourceLabel = label,
+                ruleName = "$label·交易详情",
+                note = instrument?.let { "支付方式 ${it.label}" }.orEmpty(),
+                orderId = orderId,
+                amountAnchored = true,
+                flowKey = flow.pageKey,
+                dedupKey = NotificationRules.dedupKey(
+                    snapshot.packageName, TxType.EXPENSE, false, amountCents, txTime,
+                ),
+            ),
+        )
+    }
+
+    private fun expenseAmount(lines: List<String>): String? {
+        for ((index, line) in lines.withIndex()) {
+            val labelIndex = line.indexOf("支出")
+            if (labelIndex < 0) continue
+            val afterLabel = line.substring(labelIndex + "支出".length)
+            detailAmountAfterExpense.find(afterLabel)?.groupValues?.get(1)?.let { return it }
+            if (afterLabel.isBlank()) {
+                detailAmountAfterExpense.find(lines.getOrNull(index + 1).orEmpty())
+                    ?.groupValues?.get(1)
+                    ?.let { return it }
+            }
+        }
+        return null
     }
 
     /**
