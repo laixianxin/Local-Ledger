@@ -1,17 +1,18 @@
 package com.controleco.app.ui
 
 import android.content.Intent
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -33,7 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import kotlin.math.roundToInt
+import androidx.navigation.NavBackStackEntry
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -85,6 +86,7 @@ fun AccBookNav(
 ) {
     val navController = rememberNavController()
     val context = LocalContext.current
+    val animationsEnabled = LocalAnimationsEnabled.current
 
     // 打开 App 时权限自检：只列"功能开着但没授权"的项；从捕获通知直接进入时不打断处理动线
     var permissionMissing by remember {
@@ -174,29 +176,25 @@ fun AccBookNav(
         navController = navController,
         startDestination = "main",
         modifier = Modifier.fillMaxSize(),
-        // 原型 .page-enter：淡入 + 8px 下移；返回走横向位移
         enterTransition = {
-            fadeIn(tween(260, delayMillis = 150, easing = FastOutSlowInEasing)) +
-                slideInVertically(
-                    animationSpec = tween(260, delayMillis = 150, easing = FastOutSlowInEasing),
-                    initialOffsetY = { (it * 0.0095f).roundToInt() },
-                )
+            if (animationsEnabled) getSlideInTransition() else EnterTransition.None
         },
-        // 旧页先走完（150ms）再让新页入场，避免两页同时可见
-        exitTransition = { fadeOut(tween(150, easing = FastOutSlowInEasing)) },
+        exitTransition = {
+            if (animationsEnabled) getSlideOutTransition() else ExitTransition.None
+        },
         popEnterTransition = {
-            fadeIn(tween(240, delayMillis = 140, easing = FastOutSlowInEasing)) +
-                slideInHorizontally(
-                    animationSpec = tween(240, delayMillis = 140, easing = FastOutSlowInEasing),
-                    initialOffsetX = { it / 32 },
-                )
+            if (animationsEnabled) {
+                getSlideInTransition(AnimatedContentTransitionScope.SlideDirection.End)
+            } else {
+                EnterTransition.None
+            }
         },
         popExitTransition = {
-            fadeOut(tween(140, easing = FastOutSlowInEasing)) +
-                slideOutHorizontally(
-                    animationSpec = tween(140, easing = FastOutSlowInEasing),
-                    targetOffsetX = { it / 32 },
-                )
+            if (animationsEnabled) {
+                getSlideOutTransition(AnimatedContentTransitionScope.SlideDirection.End)
+            } else {
+                ExitTransition.None
+            }
         },
     ) {
         composable("main") {
@@ -341,6 +339,34 @@ fun AccBookNav(
         )
     }
 }
+
+private object NavAnimationConfig {
+    const val DURATION = 300
+}
+
+/**
+ * 获取滑入转换效果
+ *
+ * @param direction 滑动方向（Start 表示从起始侧滑入，End 表示从结束侧滑入）
+ */
+fun AnimatedContentTransitionScope<NavBackStackEntry>.getSlideInTransition(
+    direction: AnimatedContentTransitionScope.SlideDirection = AnimatedContentTransitionScope.SlideDirection.Start
+) = slideIntoContainer(
+    towards = direction,
+    animationSpec = tween(NavAnimationConfig.DURATION, easing = LinearEasing)
+)
+
+/**
+ * 获取滑出转换效果
+ *
+ * @param direction 滑动方向（Start 表示向起始侧滑出，End 表示向结束侧滑出）
+ */
+fun AnimatedContentTransitionScope<NavBackStackEntry>.getSlideOutTransition(
+    direction: AnimatedContentTransitionScope.SlideDirection = AnimatedContentTransitionScope.SlideDirection.Start
+) = slideOutOfContainer(
+    towards = direction,
+    animationSpec = tween(NavAnimationConfig.DURATION, easing = LinearEasing)
+)
 
 /** tab 切换的位移动画时长：只做整体上移，不做两页交叉淡入 */
 private const val TAB_SWITCH_MS = 220
